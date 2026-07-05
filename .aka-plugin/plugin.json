@@ -1,0 +1,10 @@
+{
+  "name": "tool_loop_guard",
+  "version": "0.1.0",
+  "description": "Akashic repeated tool call guard plugin",
+  "akashic": {
+    "lifecycle": {
+      "entry": "plugin.py"
+    }
+  }
+}
