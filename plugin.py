@@ -21,7 +21,7 @@ class _LoopState:
 
 class ToolLoopGuard(Plugin):
     name = "tool_loop_guard"
-    version = "0.1.0"
+    version = "1.0.0"
     desc = "检测连续重复的工具调用并提前截断"
 
     def __init__(self) -> None:
