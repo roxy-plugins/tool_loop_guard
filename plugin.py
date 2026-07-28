@@ -20,6 +20,7 @@ class _LoopState:
 
 
 class ToolLoopGuard(Plugin):
+    api_version = 2
     name = "tool_loop_guard"
     version = "1.0.0"
     desc = "检测连续重复的工具调用并提前截断"
@@ -28,7 +29,7 @@ class ToolLoopGuard(Plugin):
         self._states: dict[str, _LoopState] = {}
         self._repeat_limit = _DEFAULT_REPEAT_LIMIT
 
-    async def initialize(self) -> None:
+    async def prepare(self) -> None:
         config = getattr(self, "context", None)
         plugin_config = getattr(config, "config", None)
         raw_limit = (
