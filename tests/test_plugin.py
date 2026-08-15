@@ -291,6 +291,7 @@ async def test_manager_snapshot_owns_loop_state_and_cleanup(tmp_path: Path) -> N
         plugin_home / "tool_loop_guard",
         ignore=shutil.ignore_patterns(
             ".git",
+            ".akashic-core",
             ".pytest_cache",
             "__pycache__",
         ),
