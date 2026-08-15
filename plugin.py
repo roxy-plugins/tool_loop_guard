@@ -1,16 +1,23 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import cast
 
-from agent.lifecycle.types import PreToolCtx
-from agent.plugins import Plugin, on_tool_pre
-from agent.tool_hooks import HookOutcome
+from agent.plugin_composition import Bail, Context
+from agent.tools.events import TOOL_EXECUTION_AUTHORIZE, ToolInput
 
 _DEFAULT_REPEAT_LIMIT = 3
 _DENY_PREFIX = "tool_loop_guard:"
 _EXCLUDED_TOOLS = frozenset({"task_output", "task_stop"})
+
+api_version = 3
+name = "tool_loop_guard"
+version = "2.0.0"
+desc = "检测连续重复的工具调用并提前截断"
+author = "Akashic"
+inject: tuple[()] = ()
 
 
 @dataclass
@@ -19,35 +26,18 @@ class _LoopState:
     repeat_count: int = 0
 
 
-class ToolLoopGuard(Plugin):
-    api_version = 2
-    name = "tool_loop_guard"
-    version = "1.0.0"
-    desc = "检测连续重复的工具调用并提前截断"
+class ToolLoopGuard:
+    """Own per-session repeat state and return typed authorization decisions."""
 
-    def __init__(self) -> None:
+    def __init__(self, repeat_limit: int) -> None:
         self._states: dict[str, _LoopState] = {}
-        self._repeat_limit = _DEFAULT_REPEAT_LIMIT
+        self._repeat_limit = repeat_limit
 
-    async def prepare(self) -> None:
-        config = getattr(self, "context", None)
-        plugin_config = getattr(config, "config", None)
-        raw_limit = (
-            plugin_config.get("repeat_limit", _DEFAULT_REPEAT_LIMIT)
-            if plugin_config
-            else _DEFAULT_REPEAT_LIMIT
-        )
-        try:
-            self._repeat_limit = max(2, int(raw_limit))
-        except (TypeError, ValueError):
-            self._repeat_limit = _DEFAULT_REPEAT_LIMIT
-
-    @on_tool_pre()
-    async def detect_repeated_tool_call(self, event: PreToolCtx) -> HookOutcome | None:
-        signature, active_index = self._event_signature(event)
-        if not signature or event.tool_batch_index != active_index:
+    def authorize(self, tool_input: ToolInput) -> Bail[str] | None:
+        signature, active_index = self._event_signature(tool_input)
+        if not signature or tool_input.tool_batch_index != active_index:
             return None
-        state_key = self._state_key(event)
+        state_key = self._state_key(tool_input)
         state = self._states.setdefault(state_key, _LoopState())
         if signature == state.signature:
             state.repeat_count += 1
@@ -56,41 +46,74 @@ class ToolLoopGuard(Plugin):
             state.repeat_count = 1
         if state.repeat_count < self._repeat_limit:
             return None
-        return HookOutcome(
-            decision="deny",
-            reason=(
-                f"{_DENY_PREFIX}连续重复调用工具 "
-                f"{state.repeat_count} 次，已截断并进入收尾。"
-            ),
+        return Bail(
+            f"{_DENY_PREFIX}连续重复调用工具 "
+            f"{state.repeat_count} 次，已截断并进入收尾。"
         )
 
-    def _state_key(self, event: PreToolCtx) -> str:
-        if event.session_key:
-            return f"{event.source}:{event.session_key}"
-        return f"{event.source}:{event.channel}:{event.chat_id}"
+    @staticmethod
+    def _state_key(tool_input: ToolInput) -> str:
+        if tool_input.session_key:
+            return f"{tool_input.source}:{tool_input.session_key}"
+        return f"{tool_input.source}:{tool_input.channel}:{tool_input.chat_id}"
 
-    def _signature(self, tool_name: str, arguments: dict[str, Any]) -> str:
-        args = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
-        return f"{tool_name}:{args}"
+    @staticmethod
+    def _signature(tool_name: str, arguments: Mapping[str, object]) -> str:
+        encoded = json.dumps(
+            _thaw(arguments),
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        return f"{tool_name}:{encoded}"
 
-    def _event_signature(self, event: PreToolCtx) -> tuple[str, int]:
-        if not event.tool_batch:
-            if event.tool_name in _EXCLUDED_TOOLS:
+    def _event_signature(self, tool_input: ToolInput) -> tuple[str, int]:
+        if not tool_input.tool_batch:
+            if tool_input.tool_name in _EXCLUDED_TOOLS:
                 return "", 0
-            return self._signature(event.tool_name, event.arguments), 0
+            return self._signature(tool_input.tool_name, tool_input.arguments), 0
 
         parts: list[str] = []
         active_index = -1
-        for index, tool_call in enumerate(event.tool_batch):
+        for index, tool_call in enumerate(tool_input.tool_batch):
             tool_name = str(tool_call.get("name", ""))
             if tool_name in _EXCLUDED_TOOLS:
                 continue
-            arguments = tool_call.get("arguments")
-            if not isinstance(arguments, dict):
-                arguments = {}
+            raw_arguments = tool_call.get("arguments")
+            arguments: Mapping[str, object] = {}
+            if isinstance(raw_arguments, Mapping):
+                arguments = cast(Mapping[str, object], raw_arguments)
             if active_index < 0:
                 active_index = index
-            parts.append(self._signature(tool_name, cast("dict[str, Any]", arguments)))
+            parts.append(self._signature(tool_name, arguments))
         if active_index < 0:
             return "", 0
         return "|".join(parts), active_index
+
+
+async def apply(ctx: Context, config: object) -> None:
+    """Register one generation-scoped loop authorizer."""
+
+    guard = ToolLoopGuard(_repeat_limit(config))
+    _ = await ctx.on(TOOL_EXECUTION_AUTHORIZE, guard.authorize)
+
+
+def _repeat_limit(config: object) -> int:
+    raw_limit: object = _DEFAULT_REPEAT_LIMIT
+    if isinstance(config, Mapping):
+        raw_limit = cast(Mapping[object, object], config).get(
+            "repeat_limit",
+            _DEFAULT_REPEAT_LIMIT,
+        )
+    try:
+        return max(2, int(cast(int | str, raw_limit)))
+    except (TypeError, ValueError):
+        return _DEFAULT_REPEAT_LIMIT
+
+
+def _thaw(value: object) -> object:
+    if isinstance(value, Mapping):
+        mapping = cast(Mapping[object, object], value)
+        return {str(key): _thaw(item) for key, item in mapping.items()}
+    if isinstance(value, tuple):
+        return [_thaw(item) for item in cast(tuple[object, ...], value)]
+    return value
